@@ -50,7 +50,7 @@ The following technology choices are finalized for this project.
 
 ### Infrastructure and Development Tools
 
-- Docker Compose for PostgreSQL, Redis, and Elasticsearch.
+- Docker Compose for PostgreSQL, Redis, and Elasticsearch (infrastructure services only — the backend and frontend applications run on the host during development).
 - Postman for API testing.
 - Git and GitHub for version control.
 - Environment variables for application configuration.
@@ -137,7 +137,8 @@ Stores Slack OAuth connection information.
 Fields:
 - id
 - userId
-- accessToken (encrypted at rest)
+- accessToken (encrypted at rest using AES-256-GCM with a key from the `ENCRYPTION_KEY` environment variable)
+- slackUserId (obtained from the `auth.test` Slack API response during OAuth callback)
 - teamId
 - teamName
 - connectedAt
@@ -186,7 +187,7 @@ A unique constraint on senderId, hourWindow, and notificationType can prevent du
 15. Nodemailer sends the emails through Ethereal SMTP.
 16. PostgreSQL records the delivery result.
 17. Elasticsearch indexes the updated email information.
-18. Frontend displays the updated email status.
+18. Frontend displays the updated email status. The dashboard uses periodic polling (every 10 seconds) to refresh email lists. Real-time push is not required.
 
 ### BullMQ delayed jobs
 
@@ -270,11 +271,13 @@ The worker must support parallel job processing without violating sender-specifi
 
 Implement a configurable minimum delay between individual email sends.
 
-Example:
+There are three sources for the minimum delay, applied in the following precedence order:
 
-MIN_DELAY_BETWEEN_EMAILS_MS=2000
+1. **System-wide floor** (environment variable): `MIN_DELAY_BETWEEN_EMAILS_MS=2000`. This is the absolute minimum gap the system will ever enforce. No sender or user can set a lower value.
+2. **Sender-level default** (database field): Each Sender's `minimumDelay` field sets the default for that sender. This value must be greater than or equal to the system-wide floor.
+3. **User compose-time selection**: When composing an email batch, the user may specify a delay. The backend must validate that this value is `>= max(MIN_DELAY_BETWEEN_EMAILS_MS, sender.minimumDelay)`.
 
-This means the system aims to maintain a minimum two-second gap between sends.
+The effective delay for a job is the maximum of all three values.
 
 The delay must be coordinated across multiple workers and instances, not implemented only through process-local timers.
 
@@ -297,7 +300,7 @@ This allows multiple senders to have independent hourly limits.
 
 MAX_EMAILS_PER_HOUR_PER_SENDER=200
 
-The actual value must be configurable.
+This environment variable sets the **system-wide maximum ceiling**. Each sender's `hourlyLimit` database field may set a lower per-sender value. The effective hourly limit for a given sender is `Math.min(sender.hourlyLimit, MAX_EMAILS_PER_HOUR_PER_SENDER)`. If a sender's `hourlyLimit` is not set, the environment variable value is used as the default.
 
 ### Rate-limit implementation
 
@@ -360,7 +363,7 @@ The application must send an actual Slack message when a sender reaches the hour
 1. Worker detects that a sender has reached the hourly limit.
 2. Worker identifies the associated user or tenant.
 3. Backend checks whether an active Slack connection exists.
-4. If connected, send a Slack notification using the Slack Web API.
+4. If connected, send a Slack DM to the authorizing user using their stored `slackUserId` and the Slack Web API `chat.postMessage` method.
 5. If not connected, skip notification without interrupting email processing.
 6. Record notification details to avoid repeated notifications for the same sender and hour window.
 
@@ -385,9 +388,9 @@ Remaining emails have been rescheduled to the next available hour window."
 ### Security
 
 - Store OAuth tokens securely.
-- Encrypt tokens at rest.
+- Encrypt tokens at rest using AES-256-GCM with a key from the `ENCRYPTION_KEY` environment variable.
 - Validate OAuth state parameters.
-- Request only necessary Slack scopes.
+- Request only necessary Slack scopes: `chat:write` for sending messages. Use the `auth.test` API response to resolve the authorizing user's Slack ID for DM-based notifications.
 - Never expose access tokens to the frontend.
 
 The demo must show a real Slack message arriving.
@@ -414,8 +417,8 @@ Use Nodemailer with Ethereal Email.
 
 Distinguish between transient and permanent SMTP failures.
 
-- Retry temporary failures using a controlled retry policy.
-- Record final failures.
+- Retry temporary failures using BullMQ's built-in retry mechanism. Configure jobs with `attempts: 3` and exponential backoff (`backoff: { type: 'exponential', delay: 5000 }`).
+- Record final failures after all retry attempts are exhausted.
 - Avoid sending successfully delivered emails again.
 - Do not treat a database update failure after SMTP delivery as proof that the email was not sent.
 
@@ -436,6 +439,8 @@ Elasticsearch is required to make email records searchable.
 - scheduledAt
 - sentAt
 - createdAt
+
+The email `body` is intentionally excluded from the Elasticsearch index to keep the index size manageable. Full email body content is retrieved from PostgreSQL when viewing individual email details.
 
 ### Indexing flow
 
@@ -472,7 +477,7 @@ Proposed REST API endpoints:
 
 ### Authentication
 
-POST /auth/google
+GET /auth/google
 
 GET /auth/google/callback
 
@@ -480,17 +485,29 @@ GET /auth/me
 
 POST /auth/logout
 
+### Health
+
+GET /health — Returns connectivity status of PostgreSQL, Redis, and Elasticsearch. Used for monitoring and readiness checks.
+
+### Senders
+
+POST /api/senders — Create a new sender with email, name, hourlyLimit, and minimumDelay.
+
+GET /api/senders — List senders for the authenticated user.
+
+PUT /api/senders/:id — Update sender configuration.
+
 ### Email scheduling
 
 POST /api/emails/schedule
 
-GET /api/emails/scheduled
+GET /api/emails/scheduled?page=1&limit=20
 
-GET /api/emails/sent
+GET /api/emails/sent?page=1&limit=20
 
 GET /api/emails/:id
 
-GET /api/emails/search?q=...
+GET /api/emails/search?q=...&page=1&limit=20
 
 ### Slack
 
@@ -508,13 +525,28 @@ Expose a protected BullMQ dashboard for live queue visibility.
 
 Use a BullMQ-compatible dashboard such as Bull Board.
 
-Restrict access to authorized users or administrators.
+Restrict access to authenticated users. Any user who is logged in through Google OAuth may view the queue dashboard. For production, add role-based access control using an `ADMIN_EMAILS` environment variable or a user roles field.
 
 All endpoints should include:
 - Request validation.
 - Authentication and authorization where required.
 - Consistent error responses.
 - Appropriate HTTP status codes.
+
+### Session and authentication state management
+
+Use `express-session` with `connect-redis` as the session store (Redis is already in the stack). Passport.js will serialize and deserialize the authenticated user to the session.
+
+Configuration:
+- `SESSION_SECRET` environment variable for signing session cookies.
+- Sessions are stored in Redis with a configurable TTL.
+- The frontend must include `credentials: 'include'` on all fetch/axios requests to send the session cookie.
+- Use `sameSite: 'lax'` and `secure: true` (in production) for the session cookie.
+- `GET /auth/me` reads the session cookie to identify the current user.
+
+### CORS configuration
+
+Since the frontend and backend run on different ports during development, the backend must configure CORS to allow requests from the frontend origin (`VITE_API_BASE_URL`). The CORS configuration must allow credentials (cookies) to be sent cross-origin.
 
 ## 13. Frontend Implementation
 
@@ -570,7 +602,7 @@ The frontend should:
 4. Display the number of valid email addresses.
 5. Allow the user to schedule the emails.
 
-The backend must independently validate the uploaded content.
+The backend must independently validate all email addresses submitted by the frontend. The frontend sends a JSON payload containing the parsed email address array and scheduling parameters to `POST /api/emails/schedule`. The backend validates email format, deduplicates addresses, and enforces limits. The raw CSV file is not sent to the backend.
 
 ### Scheduled Emails
 
@@ -711,6 +743,8 @@ MIN_DELAY_BETWEEN_EMAILS_MS=2000
 MAX_EMAILS_PER_HOUR_PER_SENDER=200
 
 SESSION_SECRET=
+
+ENCRYPTION_KEY=
 
 ### Frontend
 
